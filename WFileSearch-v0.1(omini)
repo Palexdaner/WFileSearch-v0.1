@@ -1,0 +1,654 @@
+#include <QApplication>
+#include <QMainWindow>
+#include <QFileSystemModel>
+#include <QTreeView>
+#include <QListView>
+#include <QSplitter>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QComboBox>
+#include <QCheckBox>
+#include <QProgressBar>
+#include <QStatusBar>
+#include <QTextEdit>
+#include <QFileDialog>
+#include <QMessageBox>
+#include <QDateTime>
+#include <QThread>
+#include <QThreadPool>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QSettings>
+#include <QDesktopServices>
+#include <QUrl>
+#include <QFileInfo>
+#include <QDir>
+#include <QFile>
+#include <QDataStream>
+#include <QStandardPaths>
+#include <QTextStream>
+#include <QImage>
+#include <QLabel>
+#include <QTimer>
+#include <QRegularExpression>
+#include <QFuture>
+#include <QtConcurrent>
+
+// 文件信息结构体
+struct FileInfo {
+    QString path;
+    QString name;
+    qint64 size;
+    QDateTime modified;
+    QDateTime created;
+    QString extension;
+    
+    bool operator<(const FileInfo& other) const {
+        return path < other.path;
+    }
+};
+
+// 索引器工作线程
+class IndexerWorker : public QObject {
+    Q_OBJECT
+public:
+    explicit IndexerWorker(QObject *parent = nullptr) : QObject(parent), m_stop(false) {}
+    
+    void indexDirectory(const QString &path, const QStringList &extFilters) {
+        QMutexLocker locker(&m_mutex);
+        m_stop = false;
+        locker.unlock();
+        
+        indexDirectoryImpl(path, extFilters);
+        
+        emit finished();
+    }
+    
+    void stop() {
+        QMutexLocker locker(&m_mutex);
+        m_stop = true;
+    }
+    
+signals:
+    void fileIndexed(const FileInfo &fileInfo);
+    void progress(int filesCount, int typesCount);
+    void finished();
+    
+private:
+    void indexDirectoryImpl(const QString &path, const QStringList &extFilters) {
+        QDir dir(path);
+        if (!dir.exists()) return;
+        
+        // 获取目录中的所有文件
+        QFileInfoList entries = dir.entryInfoList(QDir::NoDotAndDotDot | QDir::AllEntries);
+        
+        foreach (const QFileInfo &entry, entries) {
+            {
+                QMutexLocker locker(&m_mutex);
+                if (m_stop) return;
+            }
+            
+            if (entry.isDir()) {
+                indexDirectoryImpl(entry.filePath(), extFilters);
+            } else if (entry.isFile()) {
+                QString ext = entry.suffix().toLower();
+                if (!extFilters.isEmpty() && !extFilters.contains(ext, Qt::CaseInsensitive)) {
+                    continue;
+                }
+                
+                FileInfo info;
+                info.path = entry.filePath();
+                info.name = entry.fileName();
+                info.size = entry.size();
+                info.modified = entry.lastModified();
+                info.created = entry.created();
+                info.extension = ext;
+                
+                emit fileIndexed(info);
+            }
+        }
+    }
+    
+    QMutex m_mutex;
+    bool m_stop;
+};
+
+// 主窗口类
+class FileSearchWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    FileSearchWindow(QWidget *parent = nullptr) : QMainWindow(parent) {
+        setupUI();
+        setupConnections();
+        loadSettings();
+        
+        m_indexUpdateTimer = new QTimer(this);
+        m_indexUpdateTimer->setInterval(3600000); // 1小时自动更新一次
+        connect(m_indexUpdateTimer, &QTimer::timeout, this, &FileSearchWindow::autoUpdateIndex);
+        m_indexUpdateTimer->start();
+    }
+    
+    ~FileSearchWindow() {
+        saveSettings();
+    }
+    
+private slots:
+    void selectIndexDirectory() {
+        QString dir = QFileDialog::getExistingDirectory(this, "选择索引目录", 
+                                                      QStandardPaths::writableLocation(QStandardPaths::HomeLocation));
+        if (!dir.isEmpty()) {
+            m_indexDirs.append(dir);
+            m_logText->append(QString("%1 - 已选择索引目录: %2").arg(QTime::currentTime().toString(), dir));
+        }
+    }
+    
+    void startIndexing() {
+        if (m_indexDirs.isEmpty()) {
+            QMessageBox::warning(this, "警告", "请先选择要索引的目录");
+            return;
+        }
+        
+        // 获取文件类型过滤
+        QStringList extFilters;
+        QString extText = m_fileTypeEdit->text().trimmed();
+        if (!extText.isEmpty()) {
+            foreach (const QString &ext, extText.split(',', Qt::SkipEmptyParts)) {
+                QString trimmedExt = ext.trimmed();
+                if (!trimmedExt.startsWith('.')) {
+                    trimmedExt.prepend('.');
+                }
+                extFilters.append(trimmedExt.toLower());
+            }
+            m_logText->append(QString("%1 - 将只索引以下文件类型: %2")
+                             .arg(QTime::currentTime().toString(), extFilters.join(", ")));
+        }
+        
+        m_logText->append(QTime::currentTime().toString() + " - 开始索引文件...");
+        m_statusBar->showMessage("索引进行中...");
+        m_progressBar->setValue(0);
+        
+        // 清空当前索引
+        m_fileIndex.clear();
+        m_fileTypes.clear();
+        
+        // 创建工作线程
+        m_indexerWorker = new IndexerWorker();
+        m_indexerThread = new QThread();
+        m_indexerWorker->moveToThread(m_indexerThread);
+        
+        connect(m_indexerThread, &QThread::started, [this, extFilters]() {
+            foreach (const QString &dir, m_indexDirs) {
+                m_indexerWorker->indexDirectory(dir, extFilters);
+            }
+        });
+        
+        connect(m_indexerWorker, &IndexerWorker::fileIndexed, this, &FileSearchWindow::addFileToIndex);
+        connect(m_indexerWorker, &IndexerWorker::progress, this, &FileSearchWindow::updateIndexProgress);
+        connect(m_indexerWorker, &IndexerWorker::finished, this, &FileSearchWindow::indexingComplete);
+        connect(m_indexerThread, &QThread::finished, m_indexerThread, &QObject::deleteLater);
+        
+        m_indexerThread->start();
+    }
+    
+    void stopIndexing() {
+        if (m_indexerWorker) {
+            m_indexerWorker->stop();
+        }
+        m_statusBar->showMessage("索引已停止");
+        m_logText->append(QTime::currentTime().toString() + " - 索引已停止");
+    }
+    
+    void saveIndex() {
+        QString path = QFileDialog::getSaveFileName(this, "保存索引", 
+                                                   QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation), 
+                                                   "索引文件 (*.idx)");
+        if (path.isEmpty()) return;
+        
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly)) {
+            QMessageBox::critical(this, "错误", "无法创建索引文件");
+            return;
+        }
+        
+        QDataStream out(&file);
+        out << m_fileIndex << m_fileTypes << QDateTime::currentDateTime();
+        
+        m_logText->append(QString("%1 - 索引已保存到: %2").arg(QTime::currentTime().toString(), path));
+    }
+    
+    void loadIndex() {
+        QString path = QFileDialog::getOpenFileName(this, "加载索引", 
+                                                  QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation), 
+                                                  "索引文件 (*.idx)");
+        if (path.isEmpty()) return;
+        
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            QMessageBox::critical(this, "错误", "无法打开索引文件");
+            return;
+        }
+        
+        QDataStream in(&file);
+        QList<FileInfo> loadedIndex;
+        QSet<QString> loadedTypes;
+        QDateTime timestamp;
+        
+        in >> loadedIndex >> loadedTypes >> timestamp;
+        
+        if (in.status() != QDataStream::Ok) {
+            QMessageBox::critical(this, "错误", "索引文件已损坏");
+            return;
+        }
+        
+        m_fileIndex = loadedIndex;
+        m_fileTypes = loadedTypes;
+        
+        m_logText->append(QString("%1 - 已从 %2 加载索引 (共 %3 个文件, 最后更新时间: %4)")
+                         .arg(QTime::currentTime().toString(), path, 
+                              QString::number(m_fileIndex.size()), 
+                              timestamp.toString("yyyy-MM-dd hh:mm:ss")));
+        m_statusBar->showMessage(QString("索引已加载 - 共 %1 个文件").arg(m_fileIndex.size()));
+    }
+    
+    void doSearch() {
+        QString query = m_searchEdit->text().trimmed();
+        if (query.isEmpty()) {
+            QMessageBox::warning(this, "警告", "请输入搜索关键词");
+            return;
+        }
+        
+        m_logText->append(QString("%1 - 正在搜索: %2").arg(QTime::currentTime().toString(), query));
+        m_statusBar->showMessage("搜索中...");
+        
+        // 清空当前结果
+        m_resultsModel->clear();
+        m_resultsModel->setHorizontalHeaderLabels({"文件名", "路径", "大小", "修改日期"});
+        
+        // 获取搜索选项
+        bool searchContent = m_contentSearchCheck->isChecked();
+        bool useRegex = m_regexCheck->isChecked();
+        bool caseSensitive = m_caseSensitiveCheck->isChecked();
+        
+        // 在后台线程中执行搜索
+        QtConcurrent::run([this, query, searchContent, useRegex, caseSensitive]() {
+            QElapsedTimer timer;
+            timer.start();
+            
+            QList<FileInfo> results;
+            QRegularExpression regex;
+            
+            if (useRegex) {
+                QRegularExpression::PatternOptions options = QRegularExpression::NoPatternOption;
+                if (!caseSensitive) {
+                    options |= QRegularExpression::CaseInsensitiveOption;
+                }
+                regex.setPattern(query);
+                regex.setPatternOptions(options);
+            }
+            
+            foreach (const FileInfo &file, m_fileIndex) {
+                bool match = false;
+                
+                if (useRegex) {
+                    if (regex.match(file.name).hasMatch() || 
+                        (searchContent && regex.match(getFileContentPreview(file.path)).hasMatch())) {
+                        match = true;
+                    }
+                } else {
+                    Qt::CaseSensitivity sensitivity = caseSensitive ? Qt::CaseSensitive : Qt::CaseInsensitive;
+                    if (file.name.contains(query, sensitivity) || 
+                        (searchContent && getFileContentPreview(file.path).contains(query, sensitivity))) {
+                        match = true;
+                    }
+                }
+                
+                if (match) {
+                    results.append(file);
+                }
+            }
+            
+            qint64 elapsed = timer.elapsed();
+            
+            // 回到主线程更新UI
+            QMetaObject::invokeMethod(this, "displaySearchResults", 
+                                     Qt::QueuedConnection,
+                                     Q_ARG(QList<FileInfo>, results),
+                                     Q_ARG(qint64, elapsed));
+        });
+    }
+    
+    void openSelectedFile() {
+        QModelIndexList selected = m_resultsView->selectionModel()->selectedRows();
+        if (selected.isEmpty()) return;
+        
+        QString filePath = m_resultsModel->item(selected.first().row(), 1)->text();
+        if (!QDesktopServices::openUrl(QUrl::fromLocalFile(filePath))) {
+            QMessageBox::critical(this, "错误", "无法打开文件");
+            m_logText->append(QString("%1 - 打开文件失败: %2").arg(QTime::currentTime().toString(), filePath));
+        } else {
+            m_logText->append(QString("%1 - 已打开文件: %2").arg(QTime::currentTime().toString(), filePath));
+        }
+    }
+    
+    void showFilePreview(const QModelIndex &index) {
+        if (!index.isValid()) {
+            m_previewLabel->clear();
+            return;
+        }
+        
+        QString filePath = m_resultsModel->item(index.row(), 1)->text();
+        QFileInfo fileInfo(filePath);
+        
+        // 图片预览
+        if (isImageFile(fileInfo.suffix())) {
+            QPixmap pixmap(filePath);
+            if (!pixmap.isNull()) {
+                pixmap = pixmap.scaled(m_previewLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+                m_previewLabel->setPixmap(pixmap);
+                return;
+            }
+        }
+        
+        // 文本预览
+        if (isTextFile(fileInfo.suffix())) {
+            QFile file(filePath);
+            if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                QTextStream in(&file);
+                QString content = in.read(1000); // 预览前1000个字符
+                m_previewLabel->setText(content);
+                file.close();
+                return;
+            }
+        }
+        
+        // 默认预览
+        m_previewLabel->setText(QString("文件: %1\n大小: %2\n修改时间: %3")
+                               .arg(fileInfo.fileName())
+                               .arg(formatSize(fileInfo.size()))
+                               .arg(fileInfo.lastModified().toString("yyyy-MM-dd hh:mm:ss")));
+    }
+    
+    void autoUpdateIndex() {
+        if (!m_indexDirs.isEmpty()) {
+            m_logText->append(QTime::currentTime().toString() + " - 开始自动更新索引...");
+            startIndexing();
+        }
+    }
+    
+private:
+    void setupUI() {
+        // 主窗口设置
+        setWindowTitle("文件搜索与索引工具");
+        resize(1000, 700);
+        
+        // 中央部件
+        QWidget *centralWidget = new QWidget(this);
+        QVBoxLayout *mainLayout = new QVBoxLayout(centralWidget);
+        
+        // 控制面板
+        QGroupBox *controlGroup = new QGroupBox("控制面板", centralWidget);
+        QVBoxLayout *controlLayout = new QVBoxLayout(controlGroup);
+        
+        // 索引控制
+        QHBoxLayout *indexLayout = new QHBoxLayout();
+        QPushButton *selectDirBtn = new QPushButton("选择索引目录", controlGroup);
+        QPushButton *startIndexBtn = new QPushButton("开始索引", controlGroup);
+        QPushButton *stopIndexBtn = new QPushButton("停止索引", controlGroup);
+        QPushButton *saveIndexBtn = new QPushButton("保存索引", controlGroup);
+        QPushButton *loadIndexBtn = new QPushButton("加载索引", controlGroup);
+        
+        indexLayout->addWidget(selectDirBtn);
+        indexLayout->addWidget(startIndexBtn);
+        indexLayout->addWidget(stopIndexBtn);
+        indexLayout->addWidget(saveIndexBtn);
+        indexLayout->addWidget(loadIndexBtn);
+        controlLayout->addLayout(indexLayout);
+        
+        // 文件类型过滤
+        QHBoxLayout *filterLayout = new QHBoxLayout();
+        QLabel *filterLabel = new QLabel("文件类型过滤:", controlGroup);
+        m_fileTypeEdit = new QLineEdit(controlGroup);
+        m_fileTypeEdit->setPlaceholderText("如: txt,docx,pdf 留空为所有类型");
+        
+        filterLayout->addWidget(filterLabel);
+        filterLayout->addWidget(m_fileTypeEdit);
+        controlLayout->addLayout(filterLayout);
+        
+        // 搜索控制
+        QHBoxLayout *searchLayout = new QHBoxLayout();
+        QLabel *searchLabel = new QLabel("搜索:", controlGroup);
+        m_searchEdit = new QLineEdit(controlGroup);
+        QPushButton *searchBtn = new QPushButton("搜索", controlGroup);
+        
+        searchLayout->addWidget(searchLabel);
+        searchLayout->addWidget(m_searchEdit);
+        searchLayout->addWidget(searchBtn);
+        controlLayout->addLayout(searchLayout);
+        
+        // 高级搜索选项
+        QHBoxLayout *advancedLayout = new QHBoxLayout();
+        m_contentSearchCheck = new QCheckBox("内容搜索", controlGroup);
+        m_regexCheck = new QCheckBox("正则表达式", controlGroup);
+        m_caseSensitiveCheck = new QCheckBox("区分大小写", controlGroup);
+        
+        advancedLayout->addWidget(m_contentSearchCheck);
+        advancedLayout->addWidget(m_regexCheck);
+        advancedLayout->addWidget(m_caseSensitiveCheck);
+        controlLayout->addLayout(advancedLayout);
+        
+        // 状态栏
+        m_statusBar = new QStatusBar(centralWidget);
+        m_progressBar = new QProgressBar(centralWidget);
+        m_progressBar->setMaximum(100);
+        m_progressBar->setTextVisible(false);
+        m_statusBar->addPermanentWidget(m_progressBar);
+        
+        // 主分割器
+        QSplitter *mainSplitter = new QSplitter(Qt::Vertical, centralWidget);
+        
+        // 结果视图
+        QWidget *resultsWidget = new QWidget(mainSplitter);
+        QVBoxLayout *resultsLayout = new QVBoxLayout(resultsWidget);
+        
+        m_resultsModel = new QStandardItemModel(this);
+        m_resultsView = new QTreeView(resultsWidget);
+        m_resultsView->setModel(m_resultsModel);
+        m_resultsView->setRootIsDecorated(false);
+        m_resultsView->setUniformRowHeights(true);
+        m_resultsView->setSelectionMode(QAbstractItemView::SingleSelection);
+        
+        resultsLayout->addWidget(m_resultsView);
+        resultsWidget->setLayout(resultsLayout);
+        
+        // 预览分割器
+        QSplitter *previewSplitter = new QSplitter(Qt::Horizontal, mainSplitter);
+        
+        // 日志视图
+        QTextEdit *logWidget = new QTextEdit(previewSplitter);
+        logWidget->setReadOnly(true);
+        m_logText = logWidget;
+        
+        // 文件预览
+        QWidget *previewWidget = new QWidget(previewSplitter);
+        QVBoxLayout *previewLayout = new QVBoxLayout(previewWidget);
+        QLabel *previewTitle = new QLabel("文件预览", previewWidget);
+        m_previewLabel = new QLabel(previewWidget);
+        m_previewLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        m_previewLabel->setWordWrap(true);
+        
+        previewLayout->addWidget(previewTitle);
+        previewLayout->addWidget(m_previewLabel);
+        previewWidget->setLayout(previewLayout);
+        
+        previewSplitter->addWidget(logWidget);
+        previewSplitter->addWidget(previewWidget);
+        previewSplitter->setStretchFactor(0, 3);
+        previewSplitter->setStretchFactor(1, 1);
+        
+        mainSplitter->addWidget(resultsWidget);
+        mainSplitter->addWidget(previewSplitter);
+        mainSplitter->setStretchFactor(0, 3);
+        mainSplitter->setStretchFactor(1, 1);
+        
+        // 主布局
+        mainLayout->addWidget(controlGroup);
+        mainLayout->addWidget(mainSplitter);
+        mainLayout->addWidget(m_statusBar);
+        centralWidget->setLayout(mainLayout);
+        
+        setCentralWidget(centralWidget);
+        
+        // 初始化模型
+        m_resultsModel->setHorizontalHeaderLabels({"文件名", "路径", "大小", "修改日期"});
+    }
+    
+    void setupConnections() {
+        connect(m_resultsView, &QTreeView::doubleClicked, this, &FileSearchWindow::openSelectedFile);
+        connect(m_resultsView->selectionModel(), &QItemSelectionModel::currentChanged, 
+                this, &FileSearchWindow::showFilePreview);
+    }
+    
+    void loadSettings() {
+        QSettings settings;
+        restoreGeometry(settings.value("windowGeometry").toByteArray());
+        m_fileTypeEdit->setText(settings.value("fileTypeFilter").toString());
+        m_indexDirs = settings.value("indexDirs").toStringList();
+    }
+    
+    void saveSettings() {
+        QSettings settings;
+        settings.setValue("windowGeometry", saveGeometry());
+        settings.setValue("fileTypeFilter", m_fileTypeEdit->text());
+        settings.setValue("indexDirs", m_indexDirs);
+    }
+    
+    void addFileToIndex(const FileInfo &fileInfo) {
+        static int filesCount = 0;
+        static QSet<QString> typesCount;
+        
+        filesCount++;
+        typesCount.insert(fileInfo.extension);
+        
+        m_fileIndex.append(fileInfo);
+        m_fileTypes.insert(fileInfo.extension);
+        
+        // 每100个文件更新一次进度
+        if (filesCount % 100 == 0) {
+            emit m_indexerWorker->progress(filesCount, typesCount.size());
+        }
+    }
+    
+    void updateIndexProgress(int filesCount, int typesCount) {
+        m_statusBar->showMessage(QString("已索引 %1 个文件 (%2 种文件类型)").arg(filesCount).arg(typesCount));
+        m_progressBar->setValue(filesCount % 100);
+    }
+    
+    void indexingComplete() {
+        m_statusBar->showMessage(QString("索引完成 - 共 %1 个文件").arg(m_fileIndex.size()));
+        m_progressBar->setValue(100);
+        m_logText->append(QString("%1 - 索引完成! 共找到 %2 个文件")
+                         .arg(QTime::currentTime().toString(), QString::number(m_fileIndex.size())));
+        
+        m_indexerThread->quit();
+        m_indexerThread->wait();
+        m_indexerWorker->deleteLater();
+    }
+    
+    void displaySearchResults(const QList<FileInfo> &results, qint64 elapsedMs) {
+        m_statusBar->showMessage(QString("找到 %1 个结果 (耗时 %2 毫秒)").arg(results.size()).arg(elapsedMs));
+        
+        foreach (const FileInfo &file, results) {
+            QList<QStandardItem*> rowItems;
+            rowItems.append(new QStandardItem(file.name));
+            rowItems.append(new QStandardItem(file.path));
+            rowItems.append(new QStandardItem(formatSize(file.size)));
+            rowItems.append(new QStandardItem(file.modified.toString("yyyy-MM-dd hh:mm:ss")));
+            
+            m_resultsModel->appendRow(rowItems);
+        }
+        
+        m_logText->append(QString("%1 - 搜索完成 - 找到 %2 个结果")
+                         .arg(QTime::currentTime().toString(), QString::number(results.size())));
+    }
+    
+    QString getFileContentPreview(const QString &filePath) {
+        QFile file(filePath);
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            return "";
+        }
+        
+        QTextStream in(&file);
+        QString content = in.read(1000); // 只读取前1000个字符用于预览
+        file.close();
+        
+        return content;
+    }
+    
+    bool isImageFile(const QString &extension) {
+        static const QStringList imageExtensions = {"jpg", "jpeg", "png", "gif", "bmp", "tiff"};
+        return imageExtensions.contains(extension.toLower());
+    }
+    
+    bool isTextFile(const QString &extension) {
+        static const QStringList textExtensions = {"txt", "csv", "xml", "json", "html", "htm", "log", "md"};
+        return textExtensions.contains(extension.toLower());
+    }
+    
+    QString formatSize(qint64 bytes) {
+        const qint64 kb = 1024;
+        const qint64 mb = kb * 1024;
+        const qint64 gb = mb * 1024;
+        
+        if (bytes >= gb) {
+            return QString("%1 GB").arg(QString::number(bytes / (double)gb, 'f', 2));
+        } else if (bytes >= mb) {
+            return QString("%1 MB").arg(QString::number(bytes / (double)mb, 'f', 2));
+        } else if (bytes >= kb) {
+            return QString("%1 KB").arg(QString::number(bytes / (double)kb, 'f', 2));
+        } else {
+            return QString("%1 字节").arg(bytes);
+        }
+    }
+    
+private:
+    // UI 组件
+    QLineEdit *m_fileTypeEdit;
+    QLineEdit *m_searchEdit;
+    QCheckBox *m_contentSearchCheck;
+    QCheckBox *m_regexCheck;
+    QCheckBox *m_caseSensitiveCheck;
+    QStatusBar *m_statusBar;
+    QProgressBar *m_progressBar;
+    QStandardItemModel *m_resultsModel;
+    QTreeView *m_resultsView;
+    QTextEdit *m_logText;
+    QLabel *m_previewLabel;
+    
+    // 索引数据
+    QList<FileInfo> m_fileIndex;
+    QSet<QString> m_fileTypes;
+    QStringList m_indexDirs;
+    
+    // 索引线程
+    IndexerWorker *m_indexerWorker;
+    QThread *m_indexerThread;
+    
+    // 自动更新定时器
+    QTimer *m_indexUpdateTimer;
+};
+
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+    
+    // 设置应用程序信息
+    app.setApplicationName("文件搜索与索引工具");
+    app.setApplicationVersion("1.0");
+    app.setOrganizationName("MyCompany");
+    
+    FileSearchWindow window;
+    window.show();
+    
+    return app.exec();
+}
+
+#include "main.moc"
